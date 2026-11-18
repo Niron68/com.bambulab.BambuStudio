@@ -6,7 +6,8 @@ command: entrypoint
 rename-icon: BambuStudio
 finish-args:
   - --share=ipc
-  - --socket=x11
+  - --socket=wayland
+  - --socket=fallback-x11
   - --share=network
   - --device=all
   - --filesystem=home
@@ -114,7 +115,7 @@ modules:
       - -DwxUSE_LIBTIFF=sys
       - -DwxUSE_NANOSVG=OFF
       - -DwxUSE_EXPAT=sys
-      - -DwxUSE_GLCANVAS_EGL=OFF
+      - -DwxUSE_GLCANVAS_EGL=ON
     sources:
       - type: archive
         url: https://github.com/wxWidgets/wxWidgets/releases/download/v3.2.9/wxWidgets-3.2.9.tar.bz2
@@ -130,6 +131,10 @@ modules:
       # https://github.com/wxWidgets/wxWidgets/commit/071b4dd0f1
       - type: patch
         path: patches/wxwidgets-gtk-file-chooser-native.patch
+      # Wayland fixes: present the EGL canvas as opaque and make
+      # wxGetMousePosition() consistent with screen coordinates
+      - type: patch
+        path: patches/wxwidgets-wayland.patch
     cleanup:
       - /include
       - /lib/cmake
@@ -402,6 +407,10 @@ modules:
       # https://github.com/bambulab/BambuStudio/pull/11782
       - type: patch
         path: patches/no-boost-system.patch
+
+      # https://github.com/Niron68/BambuStudio/tree/wayland-support
+      - type: patch
+        path: patches/wayland-support.patch
 
       # AppData metainfo for Gnome Software & Co.
       - type: file

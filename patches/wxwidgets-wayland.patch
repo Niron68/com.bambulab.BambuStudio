@@ -1,0 +1,158 @@
+diff --git a/include/wx/gtk/private/event.h b/include/wx/gtk/private/event.h
+index b679e3006a..97a83cb91e 100644
+--- a/include/wx/gtk/private/event.h
++++ b/include/wx/gtk/private/event.h
+@@ -36,11 +36,18 @@
+ namespace wxGTKImpl
+ {
+ 
++// Remember the root coordinates of the last pointer event, used by
++// wxGetMousePosition() under Wayland where the global pointer position
++// can't be queried (defined in src/gtk/window.cpp).
++WXDLLIMPEXP_CORE void SetLastPointerPosition(double x_root, double y_root);
++
+ // init wxMouseEvent with the info from GdkEventXXX struct
+ template<typename T> void InitMouseEvent(wxWindowGTK *win,
+                                          wxMouseEvent& event,
+                                          T *gdk_event)
+ {
++    SetLastPointerPosition(gdk_event->x_root, gdk_event->y_root);
++
+     event.m_shiftDown = (gdk_event->state & GDK_SHIFT_MASK) != 0;
+     event.m_controlDown = (gdk_event->state & GDK_CONTROL_MASK) != 0;
+     event.m_altDown = (gdk_event->state & GDK_MOD1_MASK) != 0;
+diff --git a/src/gtk/window.cpp b/src/gtk/window.cpp
+index 171dddddf8..32cad4e5ec 100644
+--- a/src/gtk/window.cpp
++++ b/src/gtk/window.cpp
+@@ -2650,6 +2650,10 @@ bool wxGetKeyState(wxKeyCode WXUNUSED(key))
+ }
+ #endif // __WINDOWS__
+ 
++#ifdef __WXGTK3__
++static bool wxGetLastWaylandPointerPosition(GdkDisplay* display, int* x, int* y);
++#endif
++
+ wxMouseState wxGetMouseState()
+ {
+     wxMouseState ms;
+@@ -2671,6 +2675,7 @@ wxMouseState wxGetMouseState()
+     wxGCC_WARNING_RESTORE()
+ #endif
+     gdk_device_get_position(device, NULL, &x, &y);
++    wxGetLastWaylandPointerPosition(display, &x, &y);
+     gdk_device_get_state(device, window, NULL, &mask);
+ #else
+     gdk_display_get_pointer(display, NULL, &x, &y, &mask);
+@@ -6634,11 +6639,42 @@ wxWindow* wxFindWindowAtPointer(wxPoint& pt)
+     return found;
+ }
+ 
++#ifdef __WXGTK3__
++// Under Wayland, applications can't query the global pointer position: GDK
++// only knows the position relative to the surface under the pointer, which
++// isn't consistent with the root coordinates used by GetScreenPosition() and
++// ScreenToClient(), e.g. for popups. So remember the root coordinates of the
++// last pointer event received instead, which are consistent with them.
++static bool gs_hasLastPointerPos = false;
++static double gs_lastPointerX = 0, gs_lastPointerY = 0;
++
++WXDLLIMPEXP_CORE
++void wxGTKImpl::SetLastPointerPosition(double x_root, double y_root)
++{
++    gs_hasLastPointerPos = true;
++    gs_lastPointerX = x_root;
++    gs_lastPointerY = y_root;
++}
++
++static bool wxGetLastWaylandPointerPosition(GdkDisplay* display, int* x, int* y)
++{
++    if ( !gs_hasLastPointerPos || !wxGTKImpl::IsWayland(display) )
++        return false;
++    if ( x )
++        *x = wxRound(gs_lastPointerX);
++    if ( y )
++        *y = wxRound(gs_lastPointerY);
++    return true;
++}
++#endif // __WXGTK3__
++
+ // Get the current mouse position.
+ void wxGetMousePosition(int* x, int* y)
+ {
+     GdkDisplay* display = gdk_window_get_display(wxGetTopLevelGDK());
+ #ifdef __WXGTK3__
++    if ( wxGetLastWaylandPointerPosition(display, x, y) )
++        return;
+ #ifdef __WXGTK4__
+     GdkSeat* seat = gdk_display_get_default_seat(display);
+     GdkDevice* device = gdk_seat_get_pointer(seat);
+diff --git a/src/unix/glegl.cpp b/src/unix/glegl.cpp
+index baee0da5b8..4ff6be3d70 100644
+--- a/src/unix/glegl.cpp
++++ b/src/unix/glegl.cpp
+@@ -568,6 +568,24 @@ EGLSurface wxGLCanvasEGL::CallCreatePlatformWindowSurface(void *window) const
+                                                       EGLConfig config,
+                                                       void* window,
+                                                       EGLAttrib const* attrib_list);
++    typedef EGLSurface (*CreatePlatformWindowSurfaceEXT)(EGLDisplay display,
++                                                         EGLConfig config,
++                                                         void* window,
++                                                         EGLint const* attrib_list);
++
++    // The config may have an alpha channel (applications often request one
++    // to be able to read it back), but the window contents must not be
++    // blended with whatever is below it: under Wayland, compositors honour
++    // the alpha channel of the canvas subsurface, making it (partially)
++    // transparent if the application doesn't write alpha=1 everywhere.
++    // Use EGL_EXT_present_opaque, when available, to always present it as
++    // opaque, which is what happens with X11 too.
++#ifndef EGL_PRESENT_OPAQUE_EXT
++    #define EGL_PRESENT_OPAQUE_EXT 0x31DF
++#endif
++    const bool presentOpaque = IsExtensionSupported("EGL_EXT_present_opaque");
++    const EGLAttrib attribs[] = { EGL_PRESENT_OPAQUE_EXT, EGL_TRUE, EGL_NONE };
++    const EGLint attribsInt[] = { EGL_PRESENT_OPAQUE_EXT, EGL_TRUE, EGL_NONE };
+ 
+     if ( gs_eglMajor > 1 || (gs_eglMajor == 1 && gs_eglMinor >= 5) )
+     {
+@@ -586,12 +604,12 @@ EGLSurface wxGLCanvasEGL::CallCreatePlatformWindowSurface(void *window) const
+         {
+             return s_eglCreatePlatformWindowSurface(m_display, *m_config,
+                                                     window,
+-                                                    NULL);
++                                                    presentOpaque ? attribs : NULL);
+         }
+     }
+ 
+     // Try loading the appropriate EGL function on first use.
+-    static CreatePlatformWindowSurface s_eglCreatePlatformWindowSurfaceEXT = NULL;
++    static CreatePlatformWindowSurfaceEXT s_eglCreatePlatformWindowSurfaceEXT = NULL;
+     static bool s_extFuncInitialized = false;
+     if ( !s_extFuncInitialized )
+     {
+@@ -599,7 +617,7 @@ EGLSurface wxGLCanvasEGL::CallCreatePlatformWindowSurface(void *window) const
+ 
+         if ( IsExtensionSupported("EGL_EXT_platform_base") )
+         {
+-            s_eglCreatePlatformWindowSurfaceEXT = reinterpret_cast<CreatePlatformWindowSurface>(
++            s_eglCreatePlatformWindowSurfaceEXT = reinterpret_cast<CreatePlatformWindowSurfaceEXT>(
+                 eglGetProcAddress("eglCreatePlatformWindowSurfaceEXT"));
+         }
+     }
+@@ -608,13 +626,13 @@ EGLSurface wxGLCanvasEGL::CallCreatePlatformWindowSurface(void *window) const
+     {
+         return s_eglCreatePlatformWindowSurfaceEXT(m_display, *m_config,
+                                                    window,
+-                                                   NULL);
++                                                   presentOpaque ? attribsInt : NULL);
+     }
+     else
+     {
+         return eglCreateWindowSurface(m_display, *m_config,
+                                       reinterpret_cast<EGLNativeWindowType>(window),
+-                                      NULL);
++                                      presentOpaque ? attribsInt : NULL);
+     }
+ }
+ 
